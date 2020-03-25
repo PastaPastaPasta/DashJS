@@ -4,6 +4,7 @@ import {Platform, PlatformOpts} from './Platform';
 // @ts-ignore
 import DAPIClient from "@dashevo/dapi-client"
 import {Network, Mnemonic} from "@dashevo/dashcore-lib";
+import isReady from "./methods/isReady";
 
 const defaultSeeds = [
     '52.26.165.185',
@@ -15,8 +16,9 @@ const defaultSeeds = [
 export type DPASchema = object
 
 export interface SDKOpts {
+    seeds?: [string];
     network?: Network | string,
-    mnemonic?: Mnemonic | string,
+    mnemonic?: Mnemonic | string | null,
     apps?: SDKApps,
     accountIndex?: number,
 }
@@ -31,8 +33,8 @@ export interface SDKClients {
 
 export interface SDKApps {
     [name: string]: {
-        contractId: number,
-        schema: DPASchema
+        contractId: string,
+        contract: DPASchema
     }
 }
 
@@ -44,28 +46,39 @@ export class SDK {
     public accountIndex: number = 0;
     private readonly clients: SDKClients;
     private readonly apps: SDKApps;
-    public state: { isReady: boolean };
+    public state: { isReady: boolean, isAccountReady: boolean };
+    public isReady: Function;
 
     constructor(opts: SDKOpts = {}) {
+        this.isReady = isReady.bind(this);
 
         this.network = (opts.network !== undefined) ? opts.network.toString() : 'testnet';
-        this.apps = opts.apps || {};
+        this.apps = Object.assign({
+            dpns: {
+                contractId: '77w8Xqn25HwJhjodrHW133aXhjuTsTv9ozQaYpSHACE3'
+            }
+        }, opts.apps);
+
         this.state = {
-            isReady: false
+            isReady: false,
+            isAccountReady: false
         };
+        const seeds = (opts.seeds) ? opts.seeds : defaultSeeds;
+
         this.clients = {
-            dapi: new DAPIClient(Object.assign({
-                seeds: defaultSeeds,
-                timeout: 20000,
-                retries: 15
-            }, opts || {network: this.network}))
-        }
+            dapi: new DAPIClient({
+                seeds: seeds,
+                timeout: 1000,
+                retries: 5,
+                network: this.network
+            })
+        };
         // We accept null as parameter for a new generated mnemonic
         if (opts.mnemonic !== undefined) {
             // @ts-ignore
             this.wallet = new Wallet({...opts, transport: this.clients.dapi});
             if (this.wallet) {
-                let accountIndex = (opts.accountIndex!==undefined) ? opts.accountIndex : 0;
+                let accountIndex = (opts.accountIndex !== undefined) ? opts.accountIndex : 0;
                 this.account = this.wallet.getAccount({index: accountIndex});
             }
         }
@@ -80,27 +93,42 @@ export class SDK {
                 .isReady()
                 .then(() => {
                     // @ts-ignore
-                    self.state.isReady = true;
+                    self.state.isAccountReady = true;
                 })
         } else {
             // @ts-ignore
-            this.state.isReady = true;
+            this.state.isAccountReady = true;
         }
-        this.platform = new Platform({...platformOpts, account: this.account})
+        this.platform = new Platform({
+            ...platformOpts,
+            network: this.network,
+            account: this.account,
+        })
+
+        const promises = [];
+        for (let appName in this.apps) {
+            const app = this.apps[appName];
+            const p = this.platform?.contracts.get(app.contractId);
+            promises.push(p);
+        }
+        Promise
+            .all(promises)
+            .then((res) => {
+                this.state.isReady = true
+            })
+            .catch((e) => {
+                console.error('SDK apps fetching : failed to init', e);
+            });
+
     }
 
-    async isReady() {
-        const self = this;
-        // eslint-disable-next-line consistent-return
-        return new Promise(((resolve) => {
-            // @ts-ignore
-            if (self.state.isReady) return resolve(true);
-            // @ts-ignore
-            self.account.isReady().then(() => {
-                resolve(true)
-            });
-        }));
+
+    async disconnect() {
+        if (this.wallet) {
+            await this.wallet.disconnect();
+        }
     }
+
 
     getDAPIInstance() {
         if (this.clients['dapi'] == undefined) {
@@ -109,15 +137,6 @@ export class SDK {
         return this.clients['dapi'];
     }
 
-    addApp(appName: string, contractId: number, schema: object) {
-        if (this.apps[appName]) {
-            throw new Error(`Already using an app named ${appName}`);
-        }
-        this.apps[appName] = {
-            contractId,
-            schema
-        }
-    }
 
     getApps(): SDKApps {
         return this.apps;
